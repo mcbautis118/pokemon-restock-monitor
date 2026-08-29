@@ -1,105 +1,162 @@
 /**
- * monitor.js — orchestrator for the Pokemon TCG restock monitor.
+ * monitor.js — Pokemon TCG restock monitor
  *
- * Run modes (flags can be combined):
- *   (no flags)    Cron mode  — runs immediately, then on config.checkInterval schedule
- *   --once        One-shot   — run once and exit (GitHub Actions / CI)
- *   --test, -t    Dry-run    — full scrape + compare, log what would fire, skip notify + state save
- *   --init        Force init — re-baseline all retailers even if state already exists
+ * Enabled retailers:
+ *   - Target
+ *   - Walmart
+ *   - Amazon
+ *   - GameStop
  *
- * First-run behaviour (auto-detected when products.json is absent or empty):
- *   Scrapes all retailers + Pokemon Center, saves every product as "already seen",
- *   exits without notifying. On the second run, only genuine changes alert.
+ * Pokémon Center:
+ *   - Handled separately by scrapers/pokemoncenter.js
+ *   - Queue detection remains enabled/controlled by config
+ *   - Product scraping remains controlled by PC_COOKIE
  *
- * Subsequent-run pipeline:
- *   [1] Refresh MSRP database (no-op if < 24 h old)
- *   [2] Scrape all enabled retailers in parallel
- *   [3] Compare each retailer's results against stored state
- *       → new products (never seen before, in stock, pass keyword + MSRP filter)
- *       → restocks (was OOS/pre-order, now in stock, pass filter)
- *   [4] Send notifications  (Discord and/or email; skipped in --test mode)
- *   [5] Save updated state  (skipped in --test mode so dry-runs stay ephemeral)
+ * Run modes:
+ *   (no flags)    Cron mode
+ *   --once        Run once and exit
+ *   --test, -t    Dry-run: scrape + compare, no notifications/state save
+ *   --init        Force baseline initialization
  */
 
 require('dotenv').config();
 
 const config = require('./config');
 
-// Kept as module references (not destructured) so tests can stub individual
-// functions without re-requiring the whole module.
+// ─────────────────────────────────────────────────────────────────────────────
+// MODULE REFERENCES
+// ─────────────────────────────────────────────────────────────────────────────
+
 const targetScraper   = require('./scrapers/target');
 const walmartScraper  = require('./scrapers/walmart');
-const bestbuyScraper  = require('./scrapers/bestbuy');
 const amazonScraper   = require('./scrapers/amazon');
 const gamestopScraper = require('./scrapers/gamestop');
-const bnScraper       = require('./scrapers/barnesandnoble');
+
 const pcScraper       = require('./scrapers/pokemoncenter');
 const redditMonitor   = require('./monitors/reddit');
 const notifierMod     = require('./notifier');
 const msrpMod         = require('./msrpChecker');
 const stateMod        = require('./stateManager');
 
-// ── Logging ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// LOGGING
+// ─────────────────────────────────────────────────────────────────────────────
 
 const DIVIDER = '━'.repeat(68);
 
 const log = {
-  divider: ()           => console.log(DIVIDER),
-  phase:   (n, t, msg)  => console.log(`\n[${n}/${t}] ${msg}`),
-  info:    (...a)        => console.log('     ', ...a),
-  ok:      (...a)        => console.log('   ✓', ...a),
-  warn:    (...a)        => console.warn('   ⚠', ...a),
-  error:   (...a)        => console.error('   ✗', ...a),
-  item:    (tag, msg)    => console.log(`     ${('[' + tag + ']').padEnd(12)} ${msg}`),
-  blank:   ()            => console.log(''),
+  divider: () => console.log(DIVIDER),
+
+  phase: (n, total, msg) =>
+    console.log(`\n[${n}/${total}] ${msg}`),
+
+  info: (...args) =>
+    console.log('     ', ...args),
+
+  ok: (...args) =>
+    console.log('   ✓', ...args),
+
+  warn: (...args) =>
+    console.warn('   ⚠', ...args),
+
+  error: (...args) =>
+    console.error('   ✗', ...args),
+
+  item: (tag, msg) =>
+    console.log(`     ${('[' + tag + ']').padEnd(12)} ${msg}`),
+
+  blank: () =>
+    console.log(''),
 };
 
 function elapsed(startMs) {
-  const s = (Date.now() - startMs) / 1000;
-  return s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+  const seconds = (Date.now() - startMs) / 1000;
+
+  if (seconds < 60) {
+    return `${seconds.toFixed(1)}s`;
+  }
+
+  return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
 }
 
-// ── First-run detection ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// FIRST-RUN DETECTION
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * A first run is when the state file has never been successfully saved.
- * `lastSaved` is set by saveState() on every successful write; it's null on a
- * fresh empty state returned by loadState() when the file is absent.
- */
 function isFirstRun(state) {
   return state.lastSaved === null;
 }
 
-// ── Scraper registry ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SCRAPER REGISTRY
+//
+// IMPORTANT:
+// Barnes & Noble has been REMOVED.
+// Best Buy has also been REMOVED.
+//
+// Pokémon Center is NOT included here because it has its own special
+// queue-detection system and is handled separately below.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// fn is a thunk so it resolves through the module ref at call time, not import time.
-// This lets tests stub scraper functions without re-requiring monitor.
 const SCRAPERS = [
-  { key: 'target',          name: 'Target',          fn: () => targetScraper.scrapeTarget(),           cfg: () => config.retailers.target          },
-  { key: 'walmart',         name: 'Walmart',         fn: () => walmartScraper.scrapeWalmart(),         cfg: () => config.retailers.walmart         },
-  { key: 'bestbuy',         name: 'Best Buy',        fn: () => bestbuyScraper.scrapeBestBuy(),         cfg: () => config.retailers.bestbuy         },
-  { key: 'amazon',          name: 'Amazon',          fn: () => amazonScraper.scrapeAmazon(),           cfg: () => config.retailers.amazon          },
-  { key: 'gamestop',        name: 'GameStop',        fn: () => gamestopScraper.scrapeGameStop(),       cfg: () => config.retailers.gamestop        },
-  { key: 'barnesandnoble',  name: 'Barnes & Noble',  fn: () =>   },
+  {
+    key: 'target',
+    name: 'Target',
+    fn: () => targetScraper.scrapeTarget(),
+    cfg: () => config.retailers.target,
+  },
+
+  {
+    key: 'walmart',
+    name: 'Walmart',
+    fn: () => walmartScraper.scrapeWalmart(),
+    cfg: () => config.retailers.walmart,
+  },
+
+  {
+    key: 'amazon',
+    name: 'Amazon',
+    fn: () => amazonScraper.scrapeAmazon(),
+    cfg: () => config.retailers.amazon,
+  },
+
+  {
+    key: 'gamestop',
+    name: 'GameStop',
+    fn: () => gamestopScraper.scrapeGameStop(),
+    cfg: () => config.retailers.gamestop,
+  },
 ];
 
-// ── Phase 0: Pokemon Center queue check ──────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 1 — POKÉMON CENTER QUEUE CHECK
+// ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Check Pokemon Center for an active Queue-it queue.
- * Fires a CRITICAL notification immediately if a new queue is detected.
- * Skipped when PC_ENABLED=false or in dry-run mode.
- */
-async function checkPokemonCenterQueue(phaseNum, totalPhases, isDryRun) {
+async function checkPokemonCenterQueue(
+  phaseNum,
+  totalPhases,
+  isDryRun
+) {
   if (!config.retailers.pokemoncenter?.enabled) {
-    log.phase(phaseNum, totalPhases, 'Pokemon Center queue check  [DISABLED — set PC_ENABLED=true to enable]');
+    log.phase(
+      phaseNum,
+      totalPhases,
+      'Pokemon Center queue check [DISABLED]'
+    );
+
     return;
   }
 
-  log.phase(phaseNum, totalPhases, 'Pokemon Center queue check');
+  log.phase(
+    phaseNum,
+    totalPhases,
+    'Pokemon Center queue check'
+  );
+
   const t0 = Date.now();
 
   let result;
+
   try {
     result = await pcScraper.scrapePokemonCenter();
   } catch (err) {
@@ -107,356 +164,1000 @@ async function checkPokemonCenterQueue(phaseNum, totalPhases, isDryRun) {
     return;
   }
 
-  const { queueEvent, isNewQueue, products } = result;
+  const {
+    queueEvent,
+    isNewQueue,
+    products,
+  } = result;
 
+  // No queue
   if (!queueEvent) {
-    log.info(`No active queue detected  (${elapsed(t0)})`);
-  } else {
-    const pos  = queueEvent.position != null ? ` · position ${queueEvent.position}` : '';
-    const wait = queueEvent.waitTime  ? ` · wait ${queueEvent.waitTime}`             : '';
-    log.warn(`QUEUE DETECTED${pos}${wait}  (${elapsed(t0)})`);
+    log.info(
+      `No active queue detected (${elapsed(t0)})`
+    );
+  }
 
+  // Queue detected
+  else {
+    const pos =
+      queueEvent.position != null
+        ? ` · position ${queueEvent.position}`
+        : '';
+
+    const wait =
+      queueEvent.waitTime
+        ? ` · wait ${queueEvent.waitTime}`
+        : '';
+
+    log.warn(
+      `QUEUE DETECTED${pos}${wait} (${elapsed(t0)})`
+    );
+
+    // New queue
     if (isNewQueue) {
       if (isDryRun) {
-        log.info('Would send CRITICAL queue alert — suppressed by --test flag');
-      } else {
-        log.info('Sending CRITICAL queue alert to all channels…');
-        const alertResults = await notifierMod.notifyCritical(queueEvent);
-        for (const [channel, r] of Object.entries(alertResults)) {
-          if (r?.error)        log.error(`${channel}: ${r.error}`);
-          else if (r?.sent === false) log.warn(`${channel}: not sent (check credentials)`);
-          else                 log.ok(`${channel}: queue alert sent`);
+        log.info(
+          'Would send CRITICAL queue alert — suppressed by --test'
+        );
+      }
+
+      else {
+        log.info(
+          'Sending CRITICAL queue alert to Telegram…'
+        );
+
+        try {
+          const alertResults =
+            await notifierMod.notifyCritical(queueEvent);
+
+          for (
+            const [channel, r]
+            of Object.entries(alertResults)
+          ) {
+            if (r?.error) {
+              log.error(`${channel}: ${r.error}`);
+            }
+
+            else if (r?.sent === false) {
+              log.warn(
+                `${channel}: not sent (check credentials)`
+              );
+            }
+
+            else {
+              log.ok(
+                `${channel}: queue alert sent`
+              );
+            }
+          }
+        }
+
+        catch (err) {
+          log.error(
+            `Queue notification failed: ${err.message}`
+          );
         }
       }
-    } else {
-      log.info('Queue already known from previous run — no duplicate alert sent');
+    }
+
+    // Queue already known
+    else {
+      log.info(
+        'Queue already known from previous run — no duplicate alert'
+      );
     }
   }
 
   if (products?.length) {
-    log.info(`PC catalog: ${products.length} product(s) scraped from Pokemon Center`);
+    log.info(
+      `PC catalog: ${products.length} product(s)`
+    );
   }
 }
 
-// ── Phase 1: MSRP refresh ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 2 — MSRP DATABASE
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function refreshMsrp(phaseNum, totalPhases) {
-  log.phase(phaseNum, totalPhases, 'MSRP database');
+async function refreshMsrp(
+  phaseNum,
+  totalPhases
+) {
+  log.phase(
+    phaseNum,
+    totalPhases,
+    'MSRP database'
+  );
+
   const t0 = Date.now();
 
   try {
-    const db = await msrpMod.updateMsrpDatabase();
+    const db =
+      await msrpMod.updateMsrpDatabase();
+
     const age = db.lastUpdated
-      ? Math.round((Date.now() - new Date(db.lastUpdated).getTime()) / 1000 / 60)
+      ? Math.round(
+          (
+            Date.now() -
+            new Date(db.lastUpdated).getTime()
+          ) /
+          1000 /
+          60
+        )
       : null;
-    const ageStr = age !== null ? ` · ${age < 60 ? age + 'm' : Math.round(age / 60) + 'h'} old` : '';
-    log.ok(`${db.count} products${ageStr}  (${elapsed(t0)})`);
+
+    const ageStr =
+      age !== null
+        ? ` · ${
+            age < 60
+              ? age + 'm'
+              : Math.round(age / 60) + 'h'
+          } old`
+        : '';
+
+    log.ok(
+      `${db.count} products${ageStr} (${elapsed(t0)})`
+    );
+
     return db;
-  } catch (err) {
-    log.warn(`Update failed — using stale cache. ${err.message}`);
+  }
+
+  catch (err) {
+    log.warn(
+      `Update failed — using stale cache. ${err.message}`
+    );
+
     return null;
   }
 }
 
-// ── Phase 2: Parallel retailer scraping ───────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 3 — RETAILER SCRAPING
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function scrapeRetailers(phaseNum, totalPhases) {
-  const enabled = SCRAPERS.filter(s => s.cfg().enabled);
-  const disabled = SCRAPERS.filter(s => !s.cfg().enabled);
+async function scrapeRetailers(
+  phaseNum,
+  totalPhases
+) {
+  const enabled =
+    SCRAPERS.filter(
+      scraper => scraper.cfg()?.enabled
+    );
 
-  log.phase(phaseNum, totalPhases, `Scraping retailers  (${enabled.map(s => s.name).join(' + ') || 'none'} — parallel)`);
+  const disabled =
+    SCRAPERS.filter(
+      scraper => !scraper.cfg()?.enabled
+    );
+
+  log.phase(
+    phaseNum,
+    totalPhases,
+    `Scraping retailers (${
+      enabled.map(s => s.name).join(' + ') || 'none'
+    } — parallel)`
+  );
 
   if (disabled.length) {
-    log.info(`Disabled: ${disabled.map(s => s.name).join(', ')}`);
+    log.info(
+      `Disabled: ${disabled
+        .map(s => s.name)
+        .join(', ')}`
+    );
   }
 
   if (!enabled.length) {
-    log.warn('No retailers enabled — nothing to scrape.');
+    log.warn(
+      'No retailers enabled — nothing to scrape.'
+    );
+
     return [];
   }
 
-  // Fire all enabled scrapers simultaneously
-  const settled = await Promise.allSettled(
-    enabled.map(({ key, name, fn }) => {
-      const t0 = Date.now();
-      return fn()
-        .then(products => ({ key, name, products, elapsedMs: Date.now() - t0, error: null }))
-        .catch(err   => ({ key, name, products: [],  elapsedMs: Date.now() - t0, error: err }));
-    }),
-  );
+  const settled =
+    await Promise.allSettled(
+      enabled.map(
+        ({ key, name, fn }) => {
+          const t0 = Date.now();
 
-  const results = settled.map(s => s.value ?? s.reason);
+          return fn()
+            .then(products => ({
+              key,
+              name,
+              products,
+              elapsedMs:
+                Date.now() - t0,
+              error: null,
+            }))
 
-  for (const r of results) {
-    if (r.error) {
-      log.error(`${r.name.padEnd(10)} failed — ${r.error.message}`);
-    } else {
-      log.ok(`${r.name.padEnd(10)} ${r.products.length} product(s)  (${(r.elapsedMs / 1000).toFixed(1)}s)`);
+            .catch(error => ({
+              key,
+              name,
+              products: [],
+              elapsedMs:
+                Date.now() - t0,
+              error,
+            }));
+        }
+      )
+    );
+
+  const results =
+    settled.map(
+      result =>
+        result.value ??
+        result.reason
+    );
+
+  for (const result of results) {
+    if (result.error) {
+      log.error(
+        `${result.name.padEnd(10)} failed — ${result.error.message}`
+      );
+    }
+
+    else {
+      log.ok(
+        `${result.name.padEnd(10)} ${
+          result.products.length
+        } product(s) (${
+          (result.elapsedMs / 1000).toFixed(1)
+        }s)`
+      );
     }
   }
 
   return results;
 }
 
-// ── Phase 3a: Initialization (first run) ──────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 3B — REDDIT COMMUNITY ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function runInit(scraperResults, phaseNum, totalPhases) {
-  log.phase(phaseNum, totalPhases, 'Baseline initialization  (first run — no notifications)');
-
-  const byRetailer = {};
-  for (const r of scraperResults) {
-    if (!r.error) byRetailer[r.key] = r.products;
+async function scrapeRedditAlerts(
+  phaseNum,
+  totalPhases
+) {
+  if (
+    process.env.REDDIT_ENABLED === 'false'
+  ) {
+    return [];
   }
 
-  const summary = stateMod.initializeBaseline(byRetailer);
-  const total   = summary.reduce((n, s) => n + s.count, 0);
-
-  for (const { retailer, count } of summary) {
-    log.ok(`${retailer.padEnd(10)} ${count} products baselined`);
-  }
-
-  log.blank();
-  log.info(`${total} total products saved as baseline. Next run will detect changes.`);
-}
-
-// ── Reddit community alerts ───────────────────────────────────────────────────
-
-async function scrapeRedditAlerts(phaseNum, totalPhases) {
-  if (process.env.REDDIT_ENABLED === 'false') return [];
   try {
-    const posts = await redditMonitor.scrapeReddit();
+    const posts =
+      await redditMonitor.scrapeReddit();
+
     if (posts.length) {
-      log.ok(`Reddit     ${posts.length} community alert(s)`);
+      log.ok(
+        `Reddit     ${posts.length} community alert(s)`
+      );
     }
+
     return posts;
-  } catch (err) {
-    log.warn(`Reddit failed — ${err.message}`);
+  }
+
+  catch (err) {
+    log.warn(
+      `Reddit failed — ${err.message}`
+    );
+
     return [];
   }
 }
 
-// ── Phase 3b: Comparison (subsequent runs) ────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// INITIAL BASELINE
+// ─────────────────────────────────────────────────────────────────────────────
 
-function compareRetailers(scraperResults, state, phaseNum, totalPhases) {
-  log.phase(phaseNum, totalPhases, 'Comparing against stored state');
+async function runInit(
+  scraperResults,
+  phaseNum,
+  totalPhases
+) {
+  log.phase(
+    phaseNum,
+    totalPhases,
+    'Baseline initialization (first run — no notifications)'
+  );
 
-  const allNew       = [];
+  const byRetailer = {};
+
+  for (const result of scraperResults) {
+    if (!result.error) {
+      byRetailer[result.key] =
+        result.products;
+    }
+  }
+
+  const summary =
+    stateMod.initializeBaseline(
+      byRetailer
+    );
+
+  const total =
+    summary.reduce(
+      (n, s) => n + s.count,
+      0
+    );
+
+  for (const { retailer, count } of summary) {
+    log.ok(
+      `${retailer.padEnd(10)} ${count} products baselined`
+    );
+  }
+
+  log.blank();
+
+  log.info(
+    `${total} total products saved as baseline. ` +
+    `Next run will detect changes.`
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 4 — COMPARISON
+// ─────────────────────────────────────────────────────────────────────────────
+
+function compareRetailers(
+  scraperResults,
+  state,
+  phaseNum,
+  totalPhases
+) {
+  log.phase(
+    phaseNum,
+    totalPhases,
+    'Comparing against stored state'
+  );
+
+  const allNew = [];
   const allRestocked = [];
-  let   totalSeen    = 0;
 
-  for (const r of scraperResults) {
-    if (r.error) {
-      log.warn(`${r.name} — skipping comparison (scraper failed)`);
+  let totalSeen = 0;
+
+  for (const result of scraperResults) {
+    if (result.error) {
+      log.warn(
+        `${result.name} — skipping comparison (scraper failed)`
+      );
+
       continue;
     }
 
-    totalSeen += r.products.length;
-    const { newProducts, restockedProducts } = stateMod.compareAndUpdate(r.key, r.products, state);
+    totalSeen +=
+      result.products.length;
 
-    const newCount     = newProducts.length;
-    const restockCount = restockedProducts.length;
+    const {
+      newProducts,
+      restockedProducts,
+    } =
+      stateMod.compareAndUpdate(
+        result.key,
+        result.products,
+        state
+      );
+
+    const newCount =
+      newProducts.length;
+
+    const restockCount =
+      restockedProducts.length;
 
     if (newCount || restockCount) {
       const parts = [];
-      if (newCount)     parts.push(`${newCount} new`);
-      if (restockCount) parts.push(`${restockCount} restock`);
-      log.ok(`${r.name.padEnd(10)} ${r.products.length} seen · ${parts.join(' · ')}`);
-    } else {
-      log.info(`${r.name.padEnd(10)} ${r.products.length} seen · no changes`);
+
+      if (newCount) {
+        parts.push(
+          `${newCount} new`
+        );
+      }
+
+      if (restockCount) {
+        parts.push(
+          `${restockCount} restock`
+        );
+      }
+
+      log.ok(
+        `${result.name.padEnd(10)} ${
+          result.products.length
+        } seen · ${parts.join(' · ')}`
+      );
     }
 
-    allNew.push(...newProducts);
-    allRestocked.push(...restockedProducts);
+    else {
+      log.info(
+        `${result.name.padEnd(10)} ${
+          result.products.length
+        } seen · no changes`
+      );
+    }
+
+    allNew.push(
+      ...newProducts
+    );
+
+    allRestocked.push(
+      ...restockedProducts
+    );
   }
 
-  return { allNew, allRestocked, totalSeen };
+  return {
+    allNew,
+    allRestocked,
+    totalSeen,
+  };
 }
 
-// ── Phase 4: Log flagged products ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// LOG FLAGGED PRODUCTS
+// ─────────────────────────────────────────────────────────────────────────────
 
-function logFlaggedProducts(allNew, allRestocked) {
-  if (!allNew.length && !allRestocked.length) return;
+function logFlaggedProducts(
+  allNew,
+  allRestocked
+) {
+  if (
+    !allNew.length &&
+    !allRestocked.length
+  ) {
+    return;
+  }
 
   log.blank();
-  for (const p of allNew) {
-    const msrpNote = p.msrp ? ` (MSRP ${p.msrp.msrpFormatted})` : '';
-    log.item('NEW', `${p.name}  ${p.price}${msrpNote}  ${p.url}`);
+
+  for (const product of allNew) {
+    const msrpNote =
+      product.msrp
+        ? ` (MSRP ${product.msrp.msrpFormatted})`
+        : '';
+
+    log.item(
+      'NEW',
+      `${product.name}  ${
+        product.price
+      }${msrpNote}  ${
+        product.url
+      }`
+    );
   }
-  for (const p of allRestocked) {
-    const wasLabel = p.previousStockStatus?.replace(/_/g, ' ') ?? 'unknown';
-    const msrpNote = p.msrp ? ` (MSRP ${p.msrp.msrpFormatted})` : '';
-    log.item('RESTOCK', `${p.name}  ${p.price}${msrpNote}  was: ${wasLabel}  ${p.url}`);
+
+  for (const product of allRestocked) {
+    const wasLabel =
+      product.previousStockStatus
+        ?.replace(/_/g, ' ') ??
+      'unknown';
+
+    const msrpNote =
+      product.msrp
+        ? ` (MSRP ${product.msrp.msrpFormatted})`
+        : '';
+
+    log.item(
+      'RESTOCK',
+      `${product.name}  ${
+        product.price
+      }${msrpNote}  was: ${
+        wasLabel
+      }  ${
+        product.url
+      }`
+    );
   }
 }
 
-// ── Phase 5: Notify ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 5 — NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function sendNotifications(toNotify, phaseNum, totalPhases, isDryRun) {
-  log.phase(phaseNum, totalPhases, `Notifications${isDryRun ? '  [DRY RUN — skipped]' : ''}`);
+async function sendNotifications(
+  toNotify,
+  phaseNum,
+  totalPhases,
+  isDryRun
+) {
+  log.phase(
+    phaseNum,
+    totalPhases,
+    `Notifications${
+      isDryRun
+        ? ' [DRY RUN — skipped]'
+        : ''
+    }`
+  );
 
   if (!toNotify.length) {
-    log.info('Nothing to notify.');
+    log.info(
+      'Nothing to notify.'
+    );
+
     return;
   }
 
   if (isDryRun) {
-    log.info(`Would notify: ${toNotify.length} product(s) — suppressed by --test flag`);
+    log.info(
+      `Would notify: ${
+        toNotify.length
+      } product(s) — suppressed by --test`
+    );
+
     return;
   }
 
-  const results = await notifierMod.notify(toNotify);
+  try {
+    const results =
+      await notifierMod.notify(
+        toNotify
+      );
 
-  for (const [channel, result] of Object.entries(results)) {
-    if (result?.error)  log.error(`${channel}: ${result.error}`);
-    else if (result?.sent === false) log.warn(`${channel}: not sent (check credentials)`);
-    else                log.ok(channel);
+    for (
+      const [channel, result]
+      of Object.entries(results)
+    ) {
+      if (result?.error) {
+        log.error(
+          `${channel}: ${result.error}`
+        );
+      }
+
+      else if (
+        result?.sent === false
+      ) {
+        log.warn(
+          `${channel}: not sent (check credentials)`
+        );
+      }
+
+      else {
+        log.ok(channel);
+      }
+    }
+  }
+
+  catch (err) {
+    log.error(
+      `Notification error: ${err.message}`
+    );
   }
 }
 
-// ── Phase 6: Save state ───────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 6 — SAVE STATE
+// ─────────────────────────────────────────────────────────────────────────────
 
-function persistState(state, phaseNum, totalPhases, isDryRun) {
-  log.phase(phaseNum, totalPhases, `Save state${isDryRun ? '  [DRY RUN — skipped]' : ''}`);
+function persistState(
+  state,
+  phaseNum,
+  totalPhases,
+  isDryRun
+) {
+  log.phase(
+    phaseNum,
+    totalPhases,
+    `Save state${
+      isDryRun
+        ? ' [DRY RUN — skipped]'
+        : ''
+    }`
+  );
 
   if (isDryRun) {
-    log.info(`State not written — dry-run mode keeps state ephemeral.`);
+    log.info(
+      'State not written — dry-run mode keeps state ephemeral.'
+    );
+
     return;
   }
 
   stateMod.saveState(state);
 
-  const rows = stateMod.summarizeState(state);
-  const total = rows.reduce((n, r) => n + r.total, 0);
-  const inStock = rows.reduce((n, r) => n + r.inStock, 0);
-  log.ok(`${config.dataFile}  (${total} products tracked, ${inStock} in-stock)`);
+  const rows =
+    stateMod.summarizeState(
+      state
+    );
+
+  const total =
+    rows.reduce(
+      (n, row) =>
+        n + row.total,
+      0
+    );
+
+  const inStock =
+    rows.reduce(
+      (n, row) =>
+        n + row.inStock,
+      0
+    );
+
+  log.ok(
+    `${config.dataFile} (${total} products tracked, ${inStock} in-stock)`
+  );
 }
 
-// ── Run summary ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SUMMARY
+// ─────────────────────────────────────────────────────────────────────────────
 
 function printSummary(context) {
-  const { runStart, isDryRun, initMode, totalSeen, allNew, allRestocked } = context;
+  const {
+    runStart,
+    isDryRun,
+    initMode,
+    totalSeen,
+    allNew,
+    allRestocked,
+  } = context;
 
   log.blank();
   log.divider();
 
   const parts = [];
+
   if (initMode) {
-    parts.push('Baseline complete');
-  } else {
-    parts.push(`${totalSeen} products checked`);
-    if (allNew.length)       parts.push(`${allNew.length} new`);
-    if (allRestocked.length) parts.push(`${allRestocked.length} restocked`);
-    if (!allNew.length && !allRestocked.length) parts.push('no changes');
+    parts.push(
+      'Baseline complete'
+    );
   }
 
-  if (isDryRun) parts.push('DRY RUN');
-  parts.push(elapsed(runStart));
+  else {
+    parts.push(
+      `${totalSeen} products checked`
+    );
 
-  console.log(parts.join('  ·  '));
+    if (allNew.length) {
+      parts.push(
+        `${allNew.length} new`
+      );
+    }
+
+    if (allRestocked.length) {
+      parts.push(
+        `${allRestocked.length} restocked`
+      );
+    }
+
+    if (
+      !allNew.length &&
+      !allRestocked.length
+    ) {
+      parts.push(
+        'no changes'
+      );
+    }
+  }
+
+  if (isDryRun) {
+    parts.push(
+      'DRY RUN'
+    );
+  }
+
+  parts.push(
+    elapsed(runStart)
+  );
+
+  console.log(
+    parts.join('  ·  ')
+  );
+
   log.divider();
   log.blank();
 }
 
-// ── Main orchestration ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function run({ isDryRun = false, forceInit = false } = {}) {
-  const runStart = Date.now();
-  const now      = new Date().toISOString();
-  const state    = stateMod.loadState();
-  const initMode = forceInit || isFirstRun(state);
+async function run({
+  isDryRun = false,
+  forceInit = false,
+} = {}) {
+  const runStart =
+    Date.now();
+
+  const now =
+    new Date().toISOString();
+
+  const state =
+    stateMod.loadState();
+
+  const initMode =
+    forceInit ||
+    isFirstRun(state);
 
   // Header
   log.divider();
+
   const modeFlags = [
-    initMode  ? 'INIT'     : null,
-    isDryRun  ? 'DRY RUN'  : null,
+    initMode
+      ? 'INIT'
+      : null,
+
+    isDryRun
+      ? 'DRY RUN'
+      : null,
   ].filter(Boolean);
-  const modeSuffix = modeFlags.length ? `  [${modeFlags.join(' · ')}]` : '';
-  console.log(`Pokemon TCG Monitor  ·  ${now}${modeSuffix}`);
+
+  const modeSuffix =
+    modeFlags.length
+      ? ` [${modeFlags.join(' · ')}]`
+      : '';
+
+  console.log(
+    `Pokemon TCG Monitor · ${now}${modeSuffix}`
+  );
+
   log.divider();
 
-  // ── Phase counts depend on mode ───────────────────────────────────────────
-  // Init:       [1] PC Queue  [2] MSRP  [3] Scrape + Reddit  [4] Baseline
-  // Normal:     [1] PC Queue  [2] MSRP  [3] Scrape + Reddit  [4] Compare  [5] Notify  [6] Save
-  const totalPhases = initMode ? 4 : 6;
-  let   phase       = 0;
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase counts
+  //
+  // INIT:
+  //   1 PC Queue
+  //   2 MSRP
+  //   3 Scrapers + Reddit
+  //   4 Baseline
+  //
+  // NORMAL:
+  //   1 PC Queue
+  //   2 MSRP
+  //   3 Scrapers + Reddit
+  //   4 Compare
+  //   5 Notify
+  //   6 Save
+  // ───────────────────────────────────────────────────────────────────────────
 
-  // [1] Pokemon Center queue check — always first; fires critical alert if live
-  await checkPokemonCenterQueue(++phase, totalPhases, isDryRun);
+  const totalPhases =
+    initMode
+      ? 4
+      : 6;
 
-  // [2] MSRP database
-  await refreshMsrp(++phase, totalPhases);
+  let phase = 0;
 
-  // [3] Scrape all enabled retailers + Reddit in parallel
-  const [scraperResults, redditAlerts] = await Promise.all([
-    scrapeRetailers(++phase, totalPhases),
-    scrapeRedditAlerts(phase, totalPhases),  // runs alongside, logs its own output
-  ]);
+  // ───────────────────────────────────────────────────────────────────────────
+  // [1] Pokémon Center
+  // ───────────────────────────────────────────────────────────────────────────
+
+  await checkPokemonCenterQueue(
+    ++phase,
+    totalPhases,
+    isDryRun
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // [2] MSRP
+  // ───────────────────────────────────────────────────────────────────────────
+
+  await refreshMsrp(
+    ++phase,
+    totalPhases
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // [3] Retailers + Reddit in parallel
+  // ───────────────────────────────────────────────────────────────────────────
+
+  const [
+    scraperResults,
+    redditAlerts,
+  ] =
+    await Promise.all([
+      scrapeRetailers(
+        ++phase,
+        totalPhases
+      ),
+
+      scrapeRedditAlerts(
+        phase,
+        totalPhases
+      ),
+    ]);
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // FIRST RUN
+  // ───────────────────────────────────────────────────────────────────────────
 
   if (initMode) {
-    // [4] Baseline — mark all current products as "already seen"
-    await runInit(scraperResults, ++phase, totalPhases);
-    printSummary({ runStart, isDryRun, initMode: true, totalSeen: 0, allNew: [], allRestocked: [] });
-    return { initMode: true, newProducts: [], restockedProducts: [] };
+    await runInit(
+      scraperResults,
+      ++phase,
+      totalPhases
+    );
+
+    printSummary({
+      runStart,
+      isDryRun,
+      initMode: true,
+      totalSeen: 0,
+      allNew: [],
+      allRestocked: [],
+    });
+
+    return {
+      initMode: true,
+      newProducts: [],
+      restockedProducts: [],
+    };
   }
 
-  // [4] Compare retailer results against stored state
-  const { allNew, allRestocked, totalSeen } = compareRetailers(scraperResults, state, ++phase, totalPhases);
+  // ───────────────────────────────────────────────────────────────────────────
+  // [4] Compare
+  // ───────────────────────────────────────────────────────────────────────────
 
-  // Community alerts (Reddit) bypass state comparison — seen-ID file handles dedup
-  const toNotify = [...allNew, ...allRestocked, ...redditAlerts];
-  logFlaggedProducts(allNew, allRestocked);
+  const {
+    allNew,
+    allRestocked,
+    totalSeen,
+  } =
+    compareRetailers(
+      scraperResults,
+      state,
+      ++phase,
+      totalPhases
+    );
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Combine product + Reddit alerts
+  // ───────────────────────────────────────────────────────────────────────────
+
+  const toNotify = [
+    ...allNew,
+    ...allRestocked,
+    ...redditAlerts,
+  ];
+
+  logFlaggedProducts(
+    allNew,
+    allRestocked
+  );
 
   if (redditAlerts.length) {
     log.blank();
-    for (const p of redditAlerts) {
-      const subs = p.subreddit ? ` [r/${p.subreddit}]` : '';
-      log.item('REDDIT', `${p.name}${subs}  ${p.url ?? ''}`);
+
+    for (const post of redditAlerts) {
+      const subreddit =
+        post.subreddit
+          ? ` [r/${post.subreddit}]`
+          : '';
+
+      log.item(
+        'REDDIT',
+        `${post.name}${subreddit} ${
+          post.url ?? ''
+        }`
+      );
     }
   }
 
-  // [5] Notify
-  await sendNotifications(toNotify, ++phase, totalPhases, isDryRun);
+  // ───────────────────────────────────────────────────────────────────────────
+  // [5] Notifications
+  // ───────────────────────────────────────────────────────────────────────────
 
+  await sendNotifications(
+    toNotify,
+    ++phase,
+    totalPhases,
+    isDryRun
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
   // [6] Save
-  persistState(state, ++phase, totalPhases, isDryRun);
+  // ───────────────────────────────────────────────────────────────────────────
 
-  printSummary({ runStart, isDryRun, initMode: false, totalSeen, allNew, allRestocked });
+  persistState(
+    state,
+    ++phase,
+    totalPhases,
+    isDryRun
+  );
 
-  return { initMode: false, newProducts: allNew, restockedProducts: allRestocked };
+  // ───────────────────────────────────────────────────────────────────────────
+  // Summary
+  // ───────────────────────────────────────────────────────────────────────────
+
+  printSummary({
+    runStart,
+    isDryRun,
+    initMode: false,
+    totalSeen,
+    allNew,
+    allRestocked,
+  });
+
+  return {
+    initMode: false,
+    newProducts: allNew,
+    restockedProducts: allRestocked,
+  };
 }
 
-// ── CLI entry point ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI ENTRY POINT
+// ─────────────────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
-  const args      = process.argv.slice(2);
-  const isDryRun  = args.includes('--test') || args.includes('-t');
-  const isOnce    = args.includes('--once') || process.env.CI === 'true';
-  const forceInit = args.includes('--init');
+  const args =
+    process.argv.slice(2);
+
+  const isDryRun =
+    args.includes('--test') ||
+    args.includes('-t');
+
+  const isOnce =
+    args.includes('--once') ||
+    process.env.CI === 'true';
+
+  const forceInit =
+    args.includes('--init');
 
   if (isDryRun) {
-    console.log('[Monitor] Dry-run mode — scraping and comparing, but no notifications or state writes.');
+    console.log(
+      '[Monitor] Dry-run mode — scraping and comparing, but no notifications or state writes.'
+    );
   }
 
   const runOnce = () =>
-    run({ isDryRun, forceInit }).catch(err => {
-      console.error('\n[Monitor] Fatal error:', err.stack ?? err.message);
+    run({
+      isDryRun,
+      forceInit,
+    }).catch(err => {
+      console.error(
+        '\n[Monitor] Fatal error:',
+        err.stack ??
+        err.message
+      );
+
       process.exit(1);
     });
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // ONE SHOT
+  // ───────────────────────────────────────────────────────────────────────────
+
   if (isOnce || isDryRun) {
-    // Single execution (CI, manual test, or dry-run)
     runOnce();
-  } else {
-    // Cron mode — run immediately then on schedule
-    const cron = require('node-cron');
-    console.log(`[Monitor] Cron mode — schedule: ${config.checkInterval}`);
-    console.log('[Monitor] Starting first run immediately…\n');
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // CRON MODE
+  // ───────────────────────────────────────────────────────────────────────────
+
+  else {
+    const cron =
+      require('node-cron');
+
+    console.log(
+      `[Monitor] Cron mode — schedule: ${
+        config.checkInterval
+      }`
+    );
+
+    console.log(
+      '[Monitor] Starting first run immediately…\n'
+    );
+
     runOnce().then(() => {
-      cron.schedule(config.checkInterval, () => run({ isDryRun: false, forceInit: false }));
-      console.log(`[Monitor] Next run scheduled. Waiting…`);
+      cron.schedule(
+        config.checkInterval,
+        () =>
+          run({
+            isDryRun: false,
+            forceInit: false,
+          })
+      );
+
+      console.log(
+        `[Monitor] Next run scheduled. Waiting…`
+      );
     });
   }
 }
 
-module.exports = { run };
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORT
+// ─────────────────────────────────────────────────────────────────────────────
+
+module.exports = {
+  run,
+};
