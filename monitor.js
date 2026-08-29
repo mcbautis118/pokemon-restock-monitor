@@ -80,7 +80,7 @@ const SCRAPERS = [
   { key: 'bestbuy',         name: 'Best Buy',        fn: () => bestbuyScraper.scrapeBestBuy(),         cfg: () => config.retailers.bestbuy         },
   { key: 'amazon',          name: 'Amazon',          fn: () => amazonScraper.scrapeAmazon(),           cfg: () => config.retailers.amazon          },
   { key: 'gamestop',        name: 'GameStop',        fn: () => gamestopScraper.scrapeGameStop(),       cfg: () => config.retailers.gamestop        },
-  { key: 'barnesandnoble',  name: 'Barnes & Noble',  fn: () => bnScraper.scrapeBarnesAndNoble(),       cfg: () => config.retailers.barnesandnoble  },
+  { key: 'barnesandnoble',  name: 'Barnes & Noble',  fn: () =>   },
 ];
 
 // ── Phase 0: Pokemon Center queue check ──────────────────────────────────────
