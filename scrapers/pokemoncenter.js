@@ -438,7 +438,7 @@ function extractCustomerId(url) {
   return m ? m[1] : 'pokemoncenter';
 }
 
-// ── Product scraping (cookie-authenticated) ───────────────────────────────────
+// ── Product scraping (JSON-LD) ────────────────────────────────────────────────
 
 /**
  * Returns true when Pokemon Center's Imperva challenge was returned instead
@@ -457,162 +457,351 @@ function isImpervaChallengeOrBlock(html) {
  * Extract products from Pokemon Center category pages.
  * Reuses the same __NEXT_DATA__ + Cheerio dual-strategy as msrpChecker.
  */
-function extractProductsFromPage(html, categoryUrl) {
-  const products = [];
+/**
+ * Extract product-page URLs from a Pokemon Center category page.
+ *
+ * Pokemon Center currently renders product links in the category HTML even
+ * when its old __NEXT_DATA__ product structure is empty or has changed.
+ */
+function extractProductUrlsFromCategory(html) {
+  if (!html || typeof html !== 'string') return [];
 
-  // Strategy 1: __NEXT_DATA__ JSON blob
-  const match = html.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (match) {
+  const $ = cheerio.load(html);
+  const urls = new Set();
+
+  $('a[href*="/product/"]').each((_, el) => {
+    let href = $(el).attr('href');
+    if (!href) return;
+
     try {
-      const nd      = JSON.parse(match[1]);
-      const items   = findProductsInNextData(nd);
-      products.push(...items.map(item => normalizeProductItem(item)));
+      const url = new URL(href, PC_BASE);
+
+      if (url.hostname !== 'www.pokemoncenter.com' &&
+          url.hostname !== 'pokemoncenter.com') {
+        return;
+      }
+
+      if (!url.pathname.startsWith('/product/')) return;
+
+      // Remove query strings / tracking parameters.
+      url.search = '';
+      url.hash = '';
+
+      urls.add(url.toString());
     } catch {
-      // fall through to Cheerio
+      // Ignore malformed links.
     }
-  }
+  });
 
-  // Strategy 2: Cheerio HTML parse
-  if (!products.length) {
-    const $ = cheerio.load(html);
-    const selectors = [
-      '[data-testid="product-grid-item"]',
-      '[class*="ProductCard"]',
-      '[class*="product-card"]',
-      '[class*="product-tile"]',
-      'article:has(a[href*="/product/"])',
-    ];
-
-    for (const sel of selectors) {
-      $(sel).each((_, el) => {
-        const $el    = $(el);
-        const name   = ($el.find('[class*="name"], [class*="title"], h2, h3').first().text() || '').trim();
-        const price  = parseFloat(($el.find('[class*="price"]').first().text() || '').replace(/[^0-9.]/g, ''));
-        const href   = $el.find('a[href*="/product/"]').first().attr('href') ?? '';
-        const status = getStockStatusFromHtml($el);
-
-        if (name && name.length > 3) {
-          const url = href.startsWith('http') ? href : `${PC_BASE}${href}`;
-          products.push(normalizeParsedProduct({ name, price, url, stockStatus: status }));
-        }
-      });
-      if (products.length) break;
-    }
-  }
-
-  return products;
+  return [...urls];
 }
 
-function findProductsInNextData(obj, depth = 0, results = []) {
-  if (depth > 12 || !obj || typeof obj !== 'object') return results;
-  if (Array.isArray(obj)) {
-    if (obj.length > 0 && obj[0]?.name && (obj[0]?.price != null || obj[0]?.pricing)) {
-      results.push(...obj);
-    } else {
-      for (const el of obj.slice(0, 10)) findProductsInNextData(el, depth + 1, results);
-    }
-  } else {
-    for (const val of Object.values(obj)) findProductsInNextData(val, depth + 1, results);
+
+/**
+ * Convert schema.org availability into the monitor's stock-status format.
+ */
+function schemaAvailabilityToStockStatus(availability) {
+  const value = String(availability || '').toLowerCase();
+
+  if (value.includes('preorder') || value.includes('pre-order')) {
+    return 'pre_order';
   }
+
+  if (value.includes('instock') || value.includes('in_stock')) {
+    return 'in_stock';
+  }
+
+  if (
+    value.includes('outofstock') ||
+    value.includes('out_of_stock') ||
+    value.includes('soldout') ||
+    value.includes('discontinued')
+  ) {
+    return 'out_of_stock';
+  }
+
+  return 'out_of_stock';
+}
+
+
+/**
+ * Find Product objects inside JSON-LD.
+ *
+ * JSON-LD can be:
+ *   { "@type": "Product" }
+ *   [ ... ]
+ *   { "@graph": [ ... ] }
+ */
+function findJsonLdProducts(value, results = []) {
+  if (!value || typeof value !== 'object') return results;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      findJsonLdProducts(item, results);
+    }
+    return results;
+  }
+
+  const type = value['@type'];
+
+  if (
+    type === 'Product' ||
+    (Array.isArray(type) && type.includes('Product'))
+  ) {
+    results.push(value);
+  }
+
+  if (Array.isArray(value['@graph'])) {
+    findJsonLdProducts(value['@graph'], results);
+  }
+
   return results;
 }
 
-function getStockStatusFromHtml($el) {
-  const text = ($el.find('button, [class*="button"]').text() || '').toLowerCase();
-  if (text.includes('pre-order') || text.includes('pre order')) return 'pre_order';
-  if (text.includes('add to cart') || text.includes('shop now'))  return 'in_stock';
-  if (text.includes('sold out') || text.includes('out of stock')) return 'out_of_stock';
-  if (text.includes('coming soon') || text.includes('notify'))    return 'out_of_stock';
-  return 'out_of_stock';
-}
 
-function normalizeProductItem(raw) {
-  const name  = raw.name ?? raw.title ?? raw.displayName ?? '';
-  const price = raw.price ?? raw.salePrice ?? raw.msrp
-    ?? raw.pricing?.price ?? raw.pricing?.salePrice ?? null;
-  const priceNum = typeof price === 'number' ? price : parseFloat(String(price).replace(/[^0-9.]/g, '')) || null;
-  const url = raw.url ?? raw.pdpUrl ?? raw.canonicalUrl ?? raw.slug
-    ?? raw.href ?? '';
-  const fullUrl = url.startsWith('http') ? url : `${PC_BASE}${url}`;
-  const stockStatus = getStockStatusFromItem(raw);
+/**
+ * Parse a Pokemon Center product page using its schema.org JSON-LD.
+ */
+function extractProductFromProductPage(html, pageUrl) {
+  if (!html || typeof html !== 'string') return null;
 
-  return normalizeParsedProduct({ name, price: priceNum, url: fullUrl, stockStatus });
-}
+  const $ = cheerio.load(html);
+  const candidates = [];
 
-function getStockStatusFromItem(raw) {
-  const avail = (raw.availability ?? raw.stockStatus ?? raw.inventoryStatus ?? '').toLowerCase();
-  if (avail.includes('pre') && avail.includes('order')) return 'pre_order';
-  if (avail === 'in_stock' || avail === 'available' || avail === 'instock') return 'in_stock';
-  if (avail === 'out_of_stock' || avail === 'soldout' || avail === 'unavailable') return 'out_of_stock';
-  if (raw.purchasable === true || raw.addToCartEnabled === true) return 'in_stock';
-  if (raw.preorderable === true) return 'pre_order';
-  return 'out_of_stock';
-}
+  $('script[type="application/ld+json"]').each((_, el) => {
+    const raw = $(el).html();
+    if (!raw) return;
 
-function normalizeParsedProduct({ name, price, url, stockStatus }) {
-  const idSlug = url.replace(/.*\/product\//, '').replace(/[^a-z0-9-]/gi, '-').toLowerCase();
-  return {
-    id:           `pokemoncenter-${idSlug || encodeURIComponent(name).substring(0, 40)}`,
-    retailer:     'pokemoncenter',
+    try {
+      const json = JSON.parse(raw);
+      findJsonLdProducts(json, candidates);
+    } catch {
+      // Ignore malformed/unrelated JSON-LD blocks.
+    }
+  });
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  // Normally there is one Product object.
+  const product = candidates[0];
+
+  let offer = product.offers;
+
+  if (Array.isArray(offer)) {
+    offer = offer[0];
+  }
+
+  // Some schema implementations wrap offers in AggregateOffer.
+  if (offer?.offers && Array.isArray(offer.offers)) {
+    offer = offer.offers[0];
+  }
+
+  const name =
+    product.name ||
+    $('meta[property="og:title"]').attr('content') ||
+    $('title').text().trim();
+
+  const sku =
+    product.sku ||
+    product.mpn ||
+    '';
+
+  const rawPrice =
+    offer?.price ??
+    offer?.lowPrice ??
+    product.price ??
+    null;
+
+  const price =
+    rawPrice != null
+      ? parseFloat(String(rawPrice).replace(/[^0-9.]/g, ''))
+      : null;
+
+  const availability =
+    offer?.availability ||
+    product.availability ||
+    '';
+
+  const stockStatus =
+    schemaAvailabilityToStockStatus(availability);
+
+  const canonical =
+    product.url ||
+    offer?.url ||
+    $('link[rel="canonical"]').attr('href') ||
+    pageUrl;
+
+  if (!name) return null;
+
+  const normalized = normalizeParsedProduct({
     name,
-    brand:        'The Pokemon Company',
-    price:        price != null ? `$${Number(price).toFixed(2)}` : 'N/A',
-    priceNumeric: price,
-    regularPrice: null,
-    url,
-    inStock:      stockStatus === 'in_stock',
+    price: Number.isFinite(price) ? price : null,
+    url: canonical,
     stockStatus,
-    releaseDate:  null,
-  };
+  });
+
+  // Keep Pokemon Center's own SKU/MPN for debugging and future matching.
+  normalized.sku = sku;
+
+  return normalized;
 }
 
-async function scrapeProductCatalog(cookie) {
-  const products  = [];
-  const seen      = new Set();
-  const headers   = { Cookie: cookie, Referer: PC_BASE + '/' };
+
+/**
+ * Fetch and parse one Pokemon Center product page.
+ */
+async function scrapeProductPage(productUrl, cookie = '') {
+  const headers = {
+    Referer: PC_BASE + '/',
+  };
+
+  if (cookie) {
+    headers.Cookie = cookie;
+  }
+
+  let result;
+
+  try {
+    result = await fetchFollowingRedirects(productUrl, headers);
+  } catch (err) {
+    console.warn(`[PC] Product fetch failed (${productUrl}): ${err.message}`);
+    return null;
+  }
+
+  const { status, finalUrl, data } = result;
+
+  if (finalUrl.includes(QUEUEIT_BASE)) {
+    console.log(`[PC] Product redirected to Queue-it: ${productUrl}`);
+    return null;
+  }
+
+  if (status !== 200 && status !== 304) {
+    console.warn(`[PC] Product returned HTTP ${status}: ${productUrl}`);
+    return null;
+  }
+
+  if (isImpervaChallengeOrBlock(data)) {
+    console.warn(`[PC] Product blocked/challenged: ${productUrl}`);
+    return null;
+  }
+
+  const product = extractProductFromProductPage(data, productUrl);
+
+  if (!product) {
+    console.warn(`[PC] No Product JSON-LD found: ${productUrl}`);
+    return null;
+  }
+
+  return product;
+}
+
+
+/**
+ * Scrape Pokemon Center categories, discover product URLs, then inspect each
+ * product's JSON-LD for authoritative availability.
+ */
+async function scrapeProductCatalog(cookie = '') {
+  const discoveredUrls = new Set();
+  const categoryHeaders = {
+    Referer: PC_BASE + '/',
+  };
+
+  if (cookie) {
+    categoryHeaders.Cookie = cookie;
+  }
+
+  // ── Phase 1: discover product URLs ──────────────────────────────────────────
 
   for (const categoryPath of PC_CATEGORIES) {
     let page = 1;
 
     while (page <= config.maxPages) {
       const url = `${PC_BASE}${categoryPath}?page=${page}`;
+
       let result;
+
       try {
-        result = await fetchFollowingRedirects(url, headers);
+        result = await fetchFollowingRedirects(url, categoryHeaders);
       } catch (err) {
-        console.error(`[PC] Catalog fetch failed (${url}): ${err.message}`);
+        console.error(`[PC] Category fetch failed (${url}): ${err.message}`);
         break;
       }
 
-      const { data } = result;
+      const { status, data, finalUrl } = result;
+
+      if (finalUrl.includes(QUEUEIT_BASE)) {
+        console.log(`[PC] Category redirected to Queue-it: ${url}`);
+        break;
+      }
+
+      if (status !== 200 && status !== 304) {
+        console.warn(`[PC] Category returned HTTP ${status}: ${url}`);
+        break;
+      }
 
       if (isImpervaChallengeOrBlock(data)) {
-        console.warn(`[PC] Imperva challenge on ${url} — cookie may be expired`);
+        console.warn(`[PC] Category blocked/challenged: ${url}`);
         break;
       }
 
-      const pageProducts = extractProductsFromPage(data, url);
-      if (!pageProducts.length) {
-        console.log(`[PC] No products on ${url} — stopping pagination`);
-        break;
-      }
+      const urls = extractProductUrlsFromCategory(data);
 
       let newCount = 0;
-      for (const p of pageProducts) {
-        if (!p.id || seen.has(p.id)) continue;
-        seen.add(p.id);
-        products.push(p);
-        newCount++;
+
+      for (const productUrl of urls) {
+        if (!discoveredUrls.has(productUrl)) {
+          discoveredUrls.add(productUrl);
+          newCount++;
+        }
       }
 
-      console.log(`[PC] ${categoryPath} page ${page}: ${pageProducts.length} products (${newCount} new)`);
+      console.log(
+        `[PC] ${categoryPath} page ${page}: ` +
+        `${urls.length} product URLs (${newCount} new)`
+      );
 
-      if (pageProducts.length < 20) break;  // last page
+      if (!urls.length) break;
+
+      // If another page gives us no new URLs, pagination has probably repeated.
+      if (page > 1 && newCount === 0) break;
+
       page++;
       await sleep(DELAY_MS);
     }
 
-    await sleep(DELAY_MS * 2);
+    await sleep(DELAY_MS);
+  }
+
+  console.log(
+    `[PC] Discovered ${discoveredUrls.size} unique Pokemon Center product URLs`
+  );
+
+  // ── Phase 2: fetch product JSON-LD ──────────────────────────────────────────
+
+  const products = [];
+  let index = 0;
+
+  for (const productUrl of discoveredUrls) {
+    index++;
+
+    console.log(
+      `[PC] Product ${index}/${discoveredUrls.size}: ${productUrl}`
+    );
+
+    const product = await scrapeProductPage(productUrl, cookie);
+
+    if (product) {
+      products.push(product);
+
+      console.log(
+        `[PC]   ${product.stockStatus} | ${product.price} | ${product.name}`
+      );
+    }
+
+    // Be polite to Pokemon Center and reduce bot-block risk.
+    await sleep(350);
   }
 
   return products;
@@ -767,25 +956,28 @@ async function scrapePokemonCenter() {
 
   // ── Product scraping (cookie required) ─────────────────────────────────────
 
-  let products = [];
+let products = [];
 
-  if (cookie) {
-    console.log('[PC] Scraping product catalog…');
-    try {
-      products = await scrapeProductCatalog(cookie);
+{
+  console.log(
+    `[PC] Scraping product catalog via JSON-LD${cookie ? ' (cookie available)' : ' (no cookie)'}…`
+  );
 
-      const inStock    = products.filter(p => p.stockStatus === 'in_stock').length;
-      const outOfStock = products.filter(p => p.stockStatus === 'out_of_stock').length;
-      const preOrder   = products.filter(p => p.stockStatus === 'pre_order').length;
+  try {
+    products = await scrapeProductCatalog(cookie);
 
-      console.log(
-        `[PC] Catalog: ${products.length} products ` +
-        `(${inStock} in-stock, ${outOfStock} OOS, ${preOrder} pre-order)`,
-      );
-    } catch (err) {
-      console.error(`[PC] Product scraping failed: ${err.message}`);
-    }
+    const inStock    = products.filter(p => p.stockStatus === 'in_stock').length;
+    const outOfStock = products.filter(p => p.stockStatus === 'out_of_stock').length;
+    const preOrder   = products.filter(p => p.stockStatus === 'pre_order').length;
+
+    console.log(
+      `[PC] Catalog: ${products.length} products ` +
+      `(${inStock} in-stock, ${outOfStock} OOS, ${preOrder} pre-order)`
+    );
+  } catch (err) {
+    console.error(`[PC] Product scraping failed: ${err.message}`);
   }
+}
 
   return { queueEvent, isNewQueue, products };
 }
