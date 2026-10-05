@@ -24,6 +24,6 @@ jobs:
       - name: Run monitor
         run: node monitor.js --once
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NOTIFY_CHANNELS: discord
           BESTBUY_API_KEY: ${{ secrets.BESTBUY_API_KEY }}
