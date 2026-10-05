@@ -1,0 +1,59 @@
+name: Restockd Sacramento Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Baseline current sightings without Discord notifications'
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    # GitHub Actions cron uses UTC. Every 15 minutes provides a useful cadence
+    # while respecting that Restockd public sightings are already delayed.
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: restockd-sacramento-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore persistent Restockd state
+        uses: actions/cache/restore@v4
+        with:
+          path: data/restockd-seen.json
+          key: restockd-state-${{ github.run_id }}
+          restore-keys: |
+            restockd-state-
+
+      - name: Run Restockd monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_COMMUNITY_WEBHOOK_URL: ${{ secrets.DISCORD_COMMUNITY_WEBHOOK_URL }}
+          RESTOCKD_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.baseline || 'false' }}
+        run: node scripts/run-restockd-production.js
+
+      - name: Save persistent Restockd state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/restockd-seen.json
+          key: restockd-state-${{ github.run_id }}
