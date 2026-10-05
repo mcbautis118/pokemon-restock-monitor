@@ -38,13 +38,13 @@ module.exports = {
 
   retailers: {
     target: {
-      enabled: process.env.TARGET_ENABLED !== 'false',
+      enabled: process.env.TARGET_ENABLED !== 'true',
       name: 'Target',
       color: 0xcc0000,
       keywords,
     },
     walmart: {
-      enabled: process.env.WALMART_ENABLED !== 'false',
+      enabled: process.env.WALMART_ENABLED !== 'true',
       name: 'Walmart',
       color: 0x0071ce,
       keywords,
@@ -83,7 +83,7 @@ module.exports = {
       keywords,
     },
     pokemoncenter: {
-      enabled:         process.env.PC_ENABLED !== 'false',
+      enabled:         process.env.PC_ENABLED !== 'true',
       name:            'Pokemon Center',
       color:           0xff0000,
       // Session cookie copied from a real browser (required for product scraping;
