@@ -907,7 +907,7 @@ async function scrapePokemonCenter() {
   if (cookie) {
     console.log('[PC] Cookie set — authenticated mode (full product scraping enabled)');
   } else {
-    console.log('[PC] No PC_COOKIE — queue detection only (products skipped)');
+    console.log('[PC] No PC_COOKIE — queue detection enabled; product scraping will be attempted without cookie');
   }
 
   // ── Queue detection ─────────────────────────────────────────────────────────
