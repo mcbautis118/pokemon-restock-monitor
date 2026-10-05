@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const axios = require('axios');
-const { extractSightings } = require('../monitors/restockd');
+const { extractAllSightings, isLocal } = require('../monitors/restockd');
 
 const FEEDS = [
   'https://restockd.app/pokemon-in-store?retailer=target',
@@ -10,12 +10,22 @@ const FEEDS = [
   'https://restockd.app/pokemon-in-store?retailer=costco',
 ];
 
+function looksCalifornia(s) {
+  const text = `${s.location || ''} ${s.rawText || ''}`.toLowerCase();
+  return /\bca\b|california/.test(text);
+}
+
 async function main() {
   let total = 0;
-  console.log('[Restockd LIVE] Inspection only — NO Discord notifications will be sent.');
+  let californiaTotal = 0;
+  let localTotal = 0;
+  const samples = [];
+
+  console.log('[Restockd LIVE V2] Inspection only — NO Discord notifications will be sent.');
+  console.log('[Restockd LIVE V2] Parse nationwide first, then filter California and Sacramento area.');
 
   for (const url of FEEDS) {
-    console.log(`\n[Restockd LIVE] Fetching ${url}`);
+    console.log(`\n[Restockd LIVE V2] Fetching ${url}`);
     try {
       const { data } = await axios.get(url, {
         timeout: 15000,
@@ -25,27 +35,47 @@ async function main() {
         },
       });
 
-      const sightings = extractSightings(data, url);
-      console.log(`[Restockd LIVE] Sacramento-area matches: ${sightings.length}`);
-      total += sightings.length;
+      const all = extractAllSightings(data, url);
+      const california = all.filter(looksCalifornia);
+      const local = all.filter(s => isLocal(`${s.location} ${s.rawText}`));
 
-      sightings.forEach((s, i) => {
-        console.log(JSON.stringify({
+      total += all.length;
+      californiaTotal += california.length;
+      localTotal += local.length;
+
+      console.log(`[Restockd LIVE V2] Parsed: ${all.length} | California: ${california.length} | Sacramento-area: ${local.length}`);
+
+      for (const s of all.slice(0, 3)) {
+        samples.push({ retailer: s.store, product: s.name, location: s.location, raw: s.rawText.slice(0, 300) });
+      }
+
+      if (local.length) {
+        console.log('[Restockd LIVE V2] Sacramento-area matches:');
+        local.forEach((s, i) => console.log(JSON.stringify({
           n: i + 1,
-          store: s.store,
+          retailer: s.store,
+          product: s.name,
           location: s.location,
           status: s.stockStatus,
-          name: s.name,
           url: s.url,
-        }, null, 2));
-      });
+        }, null, 2)));
+      }
     } catch (err) {
-      console.error(`[Restockd LIVE] Fetch failed: ${err.response?.status || err.message}`);
+      console.error(`[Restockd LIVE V2] Fetch failed: ${err.response?.status || err.message}`);
       process.exitCode = 1;
     }
   }
 
-  console.log(`\n[Restockd LIVE] Done. ${total} Sacramento-area sighting block(s) extracted.`);
+  console.log('\n[Restockd LIVE V2] SAMPLE REAL ROWS (up to 3 per retailer):');
+  samples.forEach((s, i) => console.log(`${i + 1}. ${JSON.stringify(s)}`));
+
+  console.log(`\n[Restockd LIVE V2] TOTALS: parsed=${total}, California=${californiaTotal}, Sacramento-area=${localTotal}`);
+  if (total === 0) {
+    console.error('[Restockd LIVE V2] ERROR: zero nationwide rows parsed. HTML structure still does not match parser.');
+    process.exitCode = 2;
+  } else {
+    console.log('[Restockd LIVE V2] PASS: real public sighting rows were parsed.');
+  }
 }
 
 main().catch(err => {
