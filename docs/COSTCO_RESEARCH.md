@@ -21,6 +21,17 @@ The product GraphQL request accepts a `warehouseNumber`. Returned catalog data i
 
 Important: this does **not** establish access to Costco's internal ITMW quantities.
 
+## Sacramento-area warehouses confirmed from Costco's public warehouse pages
+
+Initial default watch set:
+
+- Rancho Cordova — warehouse `438` — 11260 White Rock Rd, Rancho Cordova, CA 95742
+- Sacramento — warehouse `464` — 7981 E Stockton Blvd, Sacramento, CA 95823
+- Folsom — warehouse `765` — 1800 Cavitt Dr, Folsom, CA 95630
+- Citrus Heights — warehouse `771` — 7000 Auburn Blvd, Citrus Heights, CA 95621
+
+These are public Costco warehouse numbers, not inferred store IDs. Additional nearby warehouses can be added later without changing scraper logic.
+
 ## On Hand / In Transit / On Order
 
 Community Pokémon trackers sometimes publish warehouse-level quantities such as On Hand, In Transit, and On Order. I have not found evidence that Costco exposes those fields through its documented customer inventory feature. Do not represent those quantities as available from Costco unless a legitimate customer-accessible source is verified.
@@ -75,7 +86,7 @@ The existing monitor has already shown that several retailers block or challenge
 - [x] Confirm Costco customer warehouse-inventory capability.
 - [x] Identify Costco search/product/warehouse API architecture from public implementations.
 - [ ] Verify Costco API response behavior with Pokémon item numbers without authenticated/private access.
-- [ ] Identify Sacramento-area Costco warehouse numbers through the warehouse locator.
+- [x] Identify initial Sacramento-area Costco warehouse numbers.
 - [ ] Implement `scrapers/costco.js` against customer-facing data only.
 - [ ] Add Costco config without enabling it by default.
 - [ ] Integrate Costco into `monitor.js` and state comparison.
