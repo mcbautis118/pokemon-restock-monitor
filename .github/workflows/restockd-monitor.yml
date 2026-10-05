@@ -9,9 +9,9 @@ on:
         default: true
         type: boolean
   schedule:
-    # GitHub Actions cron uses UTC. Check every 5 minutes to minimize
-    # additional delay beyond the Restockd public-feed delay.
-    - cron: '*/5 * * * *'
+    # GitHub Actions cron uses UTC. Check about every 5 minutes, offset from
+    # the top of the hour to reduce scheduling congestion.
+    - cron: '2-59/5 * * * *'
 
 permissions:
   contents: read
