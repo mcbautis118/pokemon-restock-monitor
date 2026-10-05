@@ -8,17 +8,14 @@ const filterKeywords = (process.env.FILTER_KEYWORDS || 'booster,elite trainer,et
 
 module.exports = {
   notify: {
-    // Which channels to route notifications through.
-    // Valid values: 'discord', 'email'  (comma-separated)
-    // Each channel also requires its own credentials to be set (see below).
     channels: (process.env.NOTIFY_CHANNELS || 'discord,email')
       .split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
   },
 
   discord: {
-    webhookUrl:          process.env.DISCORD_WEBHOOK_URL          || '',
+    webhookUrl: process.env.DISCORD_WEBHOOK_URL || '',
     communityWebhookUrl: process.env.DISCORD_COMMUNITY_WEBHOOK_URL || '',
-    mention:             process.env.DISCORD_MENTION              || '',
+    mention: process.env.DISCORD_MENTION || '',
   },
 
   email: {
@@ -50,64 +47,70 @@ module.exports = {
       keywords,
     },
     bestbuy: {
-  enabled: false,
-  name: 'Best Buy',
-  color: 0xffe000,
-  apiKey: process.env.BESTBUY_API_KEY || '',
-  keywords,
+      enabled: false,
+      name: 'Best Buy',
+      color: 0xffe000,
+      apiKey: process.env.BESTBUY_API_KEY || '',
+      keywords,
     },
     amazon: {
-      enabled:    process.env.AMAZON_ENABLED !== 'false',
-      name:       'Amazon',
-      color:      0xff9900,
-      accessKey:  process.env.AMAZON_ACCESS_KEY  || '',
-      secretKey:  process.env.AMAZON_SECRET_KEY  || '',
+      enabled: process.env.AMAZON_ENABLED !== 'false',
+      name: 'Amazon',
+      color: 0xff9900,
+      accessKey: process.env.AMAZON_ACCESS_KEY || '',
+      secretKey: process.env.AMAZON_SECRET_KEY || '',
       partnerTag: process.env.AMAZON_PARTNER_TAG || '',
-      // true  → include 3rd-party FBA/Prime-eligible sellers
-      // false → only items sold directly by Amazon.com (default; safer for MSRP)
-      fbaOnly:    process.env.AMAZON_FBA_ONLY === 'true',
+      fbaOnly: process.env.AMAZON_FBA_ONLY === 'true',
     },
     gamestop: {
-      // Disabled by default: GameStop uses Cloudflare Enterprise which blocks server-side
-      // HTTP requests (GitHub Actions, VPS, etc.). Enable only if you have a residential
-      // proxy configured or are running monitor.js locally from a home IP.
       enabled: process.env.GAMESTOP_ENABLED === 'true',
-      name:    'GameStop',
-      color:   0xe31837,
+      name: 'GameStop',
+      color: 0xe31837,
       keywords,
     },
     barnesandnoble: {
       enabled: process.env.BN_ENABLED !== 'false',
-      name:    'Barnes & Noble',
-      color:   0x1d6b3d,
+      name: 'Barnes & Noble',
+      color: 0x1d6b3d,
       keywords,
     },
+    costco: {
+      // Disabled until the customer-facing warehouse endpoint is live-tested
+      // from the intended runtime. No Costco login/API secret is required by
+      // this prototype.
+      enabled: process.env.COSTCO_ENABLED === 'true',
+      name: 'Costco',
+      color: 0x005dab,
+      itemNumbers: (process.env.COSTCO_ITEM_NUMBERS || '')
+        .split(',').map(s => s.trim()).filter(Boolean),
+      warehouses: [
+        { number: '438', name: 'Rancho Cordova' },
+        { number: '464', name: 'Sacramento' },
+        { number: '765', name: 'Folsom' },
+        { number: '771', name: 'Citrus Heights' },
+      ],
+    },
     pokemoncenter: {
-      enabled:         process.env.PC_ENABLED !== 'true',
-      name:            'Pokemon Center',
-      color:           0xff0000,
-      // Session cookie copied from a real browser (required for product scraping;
-      // queue detection works without it). Set PC_COOKIE env var.
-      cookie:          process.env.PC_COOKIE || '',
-      // Comma-separated product URLs to watch for queue redirects.
-      watchUrls:       (process.env.PC_WATCH_URLS || '').split(',').map(u => u.trim()).filter(Boolean),
-      // Queue-it customer IDs to probe (the subdomain before .queue-it.net).
-      queueitIds:      (process.env.PC_QUEUEIT_IDS || 'pokemoncenter,pokemon,tpci').split(',').map(s => s.trim()).filter(Boolean),
-      // When true, Discord queue alert includes @here mention.
+      enabled: process.env.PC_ENABLED !== 'true',
+      name: 'Pokemon Center',
+      color: 0xff0000,
+      cookie: process.env.PC_COOKIE || '',
+      watchUrls: (process.env.PC_WATCH_URLS || '').split(',').map(u => u.trim()).filter(Boolean),
+      queueitIds: (process.env.PC_QUEUEIT_IDS || 'pokemoncenter,pokemon,tpci').split(',').map(s => s.trim()).filter(Boolean),
       mentionEveryone: process.env.PC_QUEUE_MENTION_EVERYONE === 'true',
     },
   },
 
   reddit: {
-    enabled:    process.env.REDDIT_ENABLED !== 'false',
+    enabled: process.env.REDDIT_ENABLED !== 'false',
     subreddits: (process.env.REDDIT_SUBREDDITS || 'PokemonTCG,PokeInvesting')
       .split(',').map(s => s.trim()).filter(Boolean),
   },
 
   discordListener: {
     enabled: process.env.LISTENER_ENABLED === 'true',
-    port:    parseInt(process.env.LISTENER_PORT || '3001', 10),
-    secret:  process.env.LISTENER_SECRET || '',
+    port: parseInt(process.env.LISTENER_PORT || '3001', 10),
+    secret: process.env.LISTENER_SECRET || '',
   },
 
   filterKeywords,
