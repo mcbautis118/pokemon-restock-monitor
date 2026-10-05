@@ -28,62 +28,90 @@ function saveSeen(seen) {
   fs.writeFileSync(STATE_FILE, JSON.stringify([...seen].slice(-2000), null, 2));
 }
 
+function normalizeText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
 function isLocal(text) {
-  const s = String(text || '').toLowerCase();
+  const s = normalizeText(text).toLowerCase();
   return LOCAL_TERMS.some(term => s.includes(term));
 }
 
-function normalizeText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function retailerFromUrl(sourceUrl) {
+  try {
+    const value = new URL(sourceUrl).searchParams.get('retailer') || '';
+    return value.split('-').map(x => x.charAt(0).toUpperCase() + x.slice(1)).join(' ');
+  } catch { return 'Retailer'; }
+}
 
-function extractSightings(html, sourceUrl) {
+function rowToSighting($, row, sourceUrl) {
+  const cells = $(row).find('th,td').map((_, cell) => normalizeText($(cell).text())).get().filter(Boolean);
+  const text = normalizeText($(row).text());
+  if (!text || cells.length < 2) return null;
+
+  const lower = text.toLowerCase();
+  if (/product.*store|store.*product|recent spots/i.test(text)) return null;
+
+  const href = $(row).find('a[href]').first().attr('href');
+  let url = sourceUrl;
+  if (href) {
+    try { url = new URL(href, 'https://restockd.app').toString(); } catch {}
+  }
+
+  const retailer = retailerFromUrl(sourceUrl);
+  const product = cells[0] || text;
+  const storeLocation = cells.slice(1).join(' | ');
+  const key = `${retailer}|${cells.join('|')}`.toLowerCase();
+
+  return {
+    id: `restockd:${Buffer.from(key).toString('base64').slice(0, 100)}`,
+    retailer: 'community',
+    source: 'Restockd',
+    name: product.slice(0, 240),
+    title: product.slice(0, 240),
+    store: retailer,
+    location: storeLocation.slice(0, 240),
+    stockStatus: lower.includes('sold out') ? 'out_of_stock' : 'reported',
+    changeType: 'community_alert',
+    url,
+    redditUrl: null,
+    price: 'N/A',
+    publicDelayNote: 'Restockd public web sightings may be delayed about 60 minutes.',
+    confidence: 'Community reported — not retailer inventory verified',
+    rawText: text,
+    cells,
+    key,
+  };
+}
+
+// Parse all public "Recent spots" table rows first. Local filtering is intentionally
+// separate so diagnostics can distinguish "parser found nothing" from "no local spots".
+function extractAllSightings(html, sourceUrl) {
   const $ = cheerio.load(html);
   const results = [];
-  const seenText = new Set();
+  const keys = new Set();
 
-  // Restockd's public page can change markup, so inspect card/article/list-like
-  // containers and keep only blocks that clearly contain a Sacramento-area place.
-  $('article, li, [class*="card"], [class*="sighting"], [class*="stock"], [class*="store"]').each((_, el) => {
-    const text = normalizeText($(el).text());
-    if (text.length < 15 || text.length > 1600 || !isLocal(text) || seenText.has(text)) return;
-    seenText.add(text);
-
-    const href = $(el).find('a[href]').first().attr('href');
-    let url = sourceUrl;
-    if (href) {
-      try { url = new URL(href, 'https://restockd.app').toString(); } catch {}
-    }
-
-    const lower = text.toLowerCase();
-    const retailer = lower.includes('target') ? 'Target'
-      : lower.includes('best buy') ? 'Best Buy'
-      : lower.includes('walmart') ? 'Walmart'
-      : lower.includes('costco') ? 'Costco'
-      : 'Retailer';
-
-    const location = LOCAL_TERMS.find(term => lower.includes(term)) || 'Sacramento area';
-    const key = `${retailer}|${location}|${text}`.toLowerCase();
-
-    results.push({
-      id: `restockd:${Buffer.from(key).toString('base64').slice(0, 80)}`,
-      retailer: 'community',
-      source: 'Restockd',
-      name: text.slice(0, 240),
-      title: text.slice(0, 240),
-      store: retailer,
-      location,
-      stockStatus: lower.includes('sold out') ? 'out_of_stock' : 'reported',
-      changeType: 'community_alert',
-      url,
-      redditUrl: null,
-      price: 'N/A',
-      publicDelayNote: 'Restockd public web sightings may be delayed about 60 minutes.',
-      confidence: 'Community reported — not retailer inventory verified',
-      rawText: text,
-      key,
-    });
+  $('table tbody tr').each((_, row) => {
+    const sighting = rowToSighting($, row, sourceUrl);
+    if (!sighting || keys.has(sighting.key)) return;
+    keys.add(sighting.key);
+    results.push(sighting);
   });
 
+  // Fallback for responsive/non-table markup: inspect repeated rows that expose
+  // multiple direct text cells. This does not apply the Sacramento filter.
+  if (!results.length) {
+    $('[role="row"]').each((_, row) => {
+      const sighting = rowToSighting($, row, sourceUrl);
+      if (!sighting || keys.has(sighting.key)) return;
+      keys.add(sighting.key);
+      results.push(sighting);
+    });
+  }
+
   return results;
+}
+
+function extractSightings(html, sourceUrl) {
+  return extractAllSightings(html, sourceUrl).filter(s => isLocal(`${s.location} ${s.rawText}`));
 }
 
 async function scrapeRestockd() {
@@ -113,8 +141,8 @@ async function scrapeRestockd() {
   }
 
   saveSeen(seen);
-  console.log(`[Restockd] ${fetched} Sacramento-area public sighting block(s), ${fresh.length} new`);
+  console.log(`[Restockd] ${fetched} Sacramento-area public sighting(s), ${fresh.length} new`);
   return fresh;
 }
 
-module.exports = { scrapeRestockd, extractSightings, isLocal };
+module.exports = { scrapeRestockd, extractSightings, extractAllSightings, isLocal };
