@@ -3,10 +3,10 @@ const { sendDiscordNotification } = require('./notifiers/discord');
 
 const ITEM_NUMBER = process.env.COSTCO_POC_ITEM || '2351582';
 const WAREHOUSES = [
-  { number: '438', name: 'Rancho Cordova' },
-  { number: '464', name: 'Sacramento' },
-  { number: '765', name: 'Folsom' },
-  { number: '771', name: 'Citrus Heights' },
+  { number: '438', name: 'Rancho Cordova', zip: '95742', state: 'CA' },
+  { number: '464', name: 'Sacramento', zip: '95823', state: 'CA' },
+  { number: '765', name: 'Folsom', zip: '95630', state: 'CA' },
+  { number: '771', name: 'Citrus Heights', zip: '95610', state: 'CA' },
 ];
 
 async function main() {
@@ -17,18 +17,18 @@ async function main() {
     try {
       console.log(`[POC] Checking ${warehouse.name} #${warehouse.number}`);
       const product = await fetchWarehouseItem(ITEM_NUMBER, warehouse);
-
       if (!product) {
-        console.log(`[POC] ${warehouse.name}: no catalogData returned`);
+        console.log(`[POC] ${warehouse.name}: no usable Costco record`);
         continue;
       }
 
-      console.log(`[POC] ${warehouse.name}: ${product.stockStatus}, price=${product.price}, inWarehouse=${product.inWarehouse}`);
+      console.log(`[POC] ${warehouse.name}: status=${product.stockStatus}, source=${product.inventorySource}, buyable=${product.buyable}, inWarehouse=${product.inWarehouse}, price=${product.price}`);
+      if (product.inventorySignals) console.log(`[POC] ${warehouse.name} signals: ${product.inventorySignals.slice(0, 800)}`);
 
       notifications.push({
         ...product,
         retailer: 'costco',
-        name: `🧪 POC / TEST · ${product.name} · ${warehouse.name} #${warehouse.number}`,
+        name: `🧪 LIVE INVENTORY TEST · ${product.name} · ${warehouse.name} #${warehouse.number}`,
         price: product.price == null ? 'N/A' : `$${product.price.toFixed(2)}`,
         priceNumeric: product.price,
         changeType: 'new',
@@ -40,7 +40,7 @@ async function main() {
   }
 
   if (!notifications.length) {
-    console.error('[POC] Costco returned no usable warehouse records; no inventory notification can be truthfully sent.');
+    console.error('[POC] Costco returned no usable warehouse records.');
     process.exitCode = 2;
     return;
   }
