@@ -30,6 +30,7 @@ const config = require('./config');
 const targetScraper   = require('./scrapers/target');
 const walmartScraper  = require('./scrapers/walmart');
 const amazonScraper   = require('./scrapers/amazon');
+const bestbuyScraper  = require('./scrapers/bestbuy');
 const gamestopScraper = require('./scrapers/gamestop');
 
 const pcScraper       = require('./scrapers/pokemoncenter');
@@ -92,7 +93,7 @@ function isFirstRun(state) {
 //
 // IMPORTANT:
 // Barnes & Noble has been REMOVED.
-// Best Buy has also been REMOVED.
+// Best Buy is enabled through the scraper registry below.
 //
 // Pokémon Center is NOT included here because it has its own special
 // queue-detection system and is handled separately below.
@@ -120,6 +121,13 @@ const SCRAPERS = [
     cfg: () => config.retailers.amazon,
   },
 
+    {
+    key: 'bestbuy',
+    name: 'Best Buy',
+    fn: () => bestbuyScraper.scrapeBestBuy(),
+    cfg: () => config.retailers.bestbuy,
+  },
+  
   {
     key: 'gamestop',
     name: 'GameStop',
