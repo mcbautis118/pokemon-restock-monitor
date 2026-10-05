@@ -9,9 +9,12 @@ const WAREHOUSES = [
   { number: '771', name: 'Citrus Heights', zip: '95610', state: 'CA' },
 ];
 
+const CONFIRMED_STATUSES = new Set(['in_stock', 'out_of_stock', 'pre_order']);
+
 async function main() {
   console.log(`[POC] Costco item ${ITEM_NUMBER}`);
   const notifications = [];
+  let unknownCount = 0;
 
   for (const warehouse of WAREHOUSES) {
     try {
@@ -24,6 +27,15 @@ async function main() {
 
       console.log(`[POC] ${warehouse.name}: status=${product.stockStatus}, source=${product.inventorySource}, buyable=${product.buyable}, inWarehouse=${product.inWarehouse}, price=${product.price}`);
       if (product.inventorySignals) console.log(`[POC] ${warehouse.name} signals: ${product.inventorySignals.slice(0, 800)}`);
+
+      // Safety rule: catalog-only/buyable data does NOT prove warehouse stock.
+      // Never send a Discord stock alert unless Costco returned a warehouse-scoped
+      // signal that we could classify explicitly.
+      if (!CONFIRMED_STATUSES.has(product.stockStatus) || product.inventorySource !== 'costco_warehouse_search') {
+        unknownCount++;
+        console.log(`[POC] ${warehouse.name}: inventory NOT CONFIRMED — suppressing Discord stock alert`);
+        continue;
+      }
 
       notifications.push({
         ...product,
@@ -39,9 +51,10 @@ async function main() {
     }
   }
 
+  console.log(`[POC] Summary: ${notifications.length} confirmed warehouse result(s), ${unknownCount} unknown/suppressed`);
+
   if (!notifications.length) {
-    console.error('[POC] Costco returned no usable warehouse records.');
-    process.exitCode = 2;
+    console.log('[POC] No confirmed warehouse inventory results. No Discord stock alert sent (prevents false positives).');
     return;
   }
 
