@@ -28,6 +28,7 @@ test('parses minute, hour and day ages', () => {
   assert.deepEqual(parseAge('8m ago'), { ageText: '8m ago', ageMinutes: 8 });
   assert.deepEqual(parseAge('1h ago'), { ageText: '1h ago', ageMinutes: 60 });
   assert.deepEqual(parseAge('3d ago'), { ageText: '3d ago', ageMinutes: 4320 });
+  assert.deepEqual(parseAge('just now'), { ageText: 'just now', ageMinutes: 0 });
 });
 
 test('grades freshness', () => {
