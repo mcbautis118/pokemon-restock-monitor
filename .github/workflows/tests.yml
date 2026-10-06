@@ -23,3 +23,5 @@ jobs:
         run: npm ci
       - name: Run tests
         run: node --test tests/restockd.test.js
+      - name: Live Restockd inspection
+        run: node scripts/inspect-restockd-live.js
